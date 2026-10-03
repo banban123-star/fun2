@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Golem Puppeteer</title>
+<style>
+:root{--bg:#0b0d10;--rune:255,160,50;--ice:#f2ead8}
+*{box-sizing:border-box;margin:0}
+html,body{height:100%;background:var(--bg);color:var(--ice);font-family:"Courier New",monospace;overflow:hidden;
+  touch-action:none;user-select:none;-webkit-user-select:none;overscroll-behavior:none;-webkit-tap-highlight-color:transparent}
+#stage{position:relative;width:100%;height:100vh;height:100dvh;overflow:hidden}
+video,canvas{position:absolute;inset:0;width:100%;height:100%}
+video{object-fit:cover;transform:scaleX(-1);filter:brightness(.5) saturate(.8)}
+button{position:absolute;z-index:5;font:inherit;letter-spacing:.12em;color:rgb(var(--rune));cursor:pointer;
+  background:rgba(11,13,16,.85);border:1px solid rgb(var(--rune))}
+button:hover,button:focus-visible{background:rgb(var(--rune));color:#14171c;outline:none}
+#start{padding:18px 30px;font-size:15px;top:50%;left:50%;transform:translate(-50%,-50%);box-shadow:0 0 26px rgba(var(--rune),.35)}
+#flip{bottom:calc(16px + env(safe-area-inset-bottom,0px));right:calc(16px + env(safe-area-inset-right,0px));
+  padding:13px 16px;min-height:44px;font-size:12px}
+#state{position:absolute;top:calc(16px + env(safe-area-inset-top,0px));left:50%;transform:translateX(-50%);padding:10px 18px;
+  max-width:92%;text-align:center;font-size:12px;background:rgba(11,13,16,.8);border:1px solid rgb(var(--rune))}
+#state:empty{display:none}
+#msg{position:absolute;bottom:calc(16px + env(safe-area-inset-bottom,0px));left:calc(16px + env(safe-area-inset-left,0px));
+  max-width:calc(100% - 170px);font-size:12px;line-height:1.5;text-shadow:0 0 6px #000;transition:opacity .8s}
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" playsinline webkit-playsinline muted autoplay></video>
+  <canvas id="cv"></canvas>
+  <div id="state"></div>
+  <button id="start">WAKE THE GOLEM</button>
+  <button id="flip" hidden>FLIP CAMERA</button>
+  <div id="msg">Use both hands: each hand runs its own side. Thumb holds the head, index moves the hand, middle the elbow, ring the knee, pinky the foot. One hand also works. Tap to reset.</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script>
+const $ = id => document.getElementById(id);
+const video = $('video'), cv = $('cv'), ctx = cv.getContext('2d');
+const LOW = matchMedia('(pointer:coarse)').matches || innerWidth < 700;
+const RUNE = '255,160,50', TIP = [4, 8, 12, 16, 20];
+let W, H, mirror = true, facing = 'user', stream = null, model = null, running = false, looping = false, lastTime = -1;
+let hands = [], anc = [null, null], att = [false, false], miss = [0, 0];
+
+function resize(){
+  const d = Math.min(devicePixelRatio || 1, LOW ? 2 : 3);
+  W = innerWidth; H = innerHeight; cv.width = W * d; cv.height = H * d; ctx.setTransform(d, 0, 0, d, 0, 0);
+}
+addEventListener('resize', resize); addEventListener('orientationchange', () => setTimeout(resize, 250)); resize();
+
+function toScreen(p){   // landmark -> screen pixels (matches object-fit: cover)
+  const vw = video.videoWidth || 640, vh = video.videoHeight || 480, s = Math.max(W / vw, H / vh);
+  const x = p.x * vw * s + (W - vw * s) / 2;
+  return { x: mirror ? W - x : x, y: p.y * vh * s + (H - vh * s) / 2 };
+}
+
+/* ---------------- GOLEM RIG (verlet physics) ---------------- */
+const N = ['head','shL','shR','hpL','hpR','elL','elR','haL','haR','knL','knR','ftL','ftR'];
+const I = {}; N.forEach((n, i) => I[n] = i);
+let P = [], C = [], strings = [], G = 100;
+
+function buildGolem(cx, cy){
+  G = Math.min(H * .34, W * .62);
+  const sw = .17 * G, hw = .12 * G, th = .42 * G, u = .26 * G, l = .3 * G;
+  const r = { head:[0,-th-.2*G], shL:[-sw,-th], shR:[sw,-th], hpL:[-hw,0], hpR:[hw,0],
+    elL:[-sw-.03*G,-th+u], elR:[sw+.03*G,-th+u], haL:[-sw-.05*G,-th+2*u], haR:[sw+.05*G,-th+2*u],
+    knL:[-hw-.02*G,l], knR:[hw+.02*G,l], ftL:[-hw-.02*G,2*l], ftR:[hw+.02*G,2*l] };
+  P = N.map(n => { const x = cx + r[n][0], y = cy + r[n][1]; return { x, y, ox: x, oy: y }; });
+  C = [];
+  const link = (a, b, k = 1) => { const A = P[I[a]], B = P[I[b]]; C.push({ a: I[a], b: I[b], len: Math.hypot(A.x - B.x, A.y - B.y), k }); };
+  const keep = (a, b, f) => { const A = P[I[a]], B = P[I[b]]; C.push({ a: I[a], b: I[b], len: f * Math.hypot(A.x - B.x, A.y - B.y), min: true }); };
+  [['shL','shR'],['hpL','hpR'],['shL','hpL'],['shR','hpR'],['shL','hpR'],['shR','hpL'],
+   ['head','shL'],['head','shR'],['shL','elL'],['elL','haL'],['shR','elR'],['elR','haR'],
+   ['hpL','knL'],['knL','ftL'],['hpR','knR'],['knR','ftR']].forEach(c => link(...c));
+  link('head','hpL',.6); link('head','hpR',.6);
+  keep('shL','haL',.5); keep('shR','haR',.5); keep('hpL','ftL',.6); keep('hpR','ftR',.6);   // limbs can't fold flat
+}
+
+// One hand: fingers sorted left to right drive these parts
+const ROLES = ['ftL','haL','head','haR','ftR'];
+
+// Strings are a bit longer than the gap at attach time, so the golem has room to move
+const mkLen = (a, p) => Math.min(Math.hypot(a.x - p.x, a.y - p.y) * 1.2 + G * .15, H * .95);
+const addString = (h, tip, part) => strings.push({ h, tip, part: I[part], len: mkLen(anc[h][tip], P[I[part]]) });
+
+function rebuildStrings(){
+  strings = [];
+  const act = [0, 1].filter(h => att[h]);
+  if(act.length === 2){   // two hands: each hand runs its own side of the body, thumbs hold the head
+    const ax = h => anc[h].reduce((n, p) => n + p.x, 0) / 5;
+    const [L, R] = ax(0) < ax(1) ? [0, 1] : [1, 0];
+    [[L, 'L'], [R, 'R']].forEach(([h, side]) =>
+      ['head', 'ha' + side, 'el' + side, 'kn' + side, 'ft' + side].forEach((part, tip) => addString(h, tip, part)));
+  } else if(act.length === 1){
+    const h = act[0];
+    [0, 1, 2, 3, 4].sort((x, y) => anc[h][x].x - anc[h][y].x).forEach((tip, k) => addString(h, tip, ROLES[k]));
+  }
+}
+
+function attach(h){
+  const pts = hands[h];
+  anc[h] = TIP.map(id => ({ x: pts[id].x, y: pts[id].y }));
+  if(!P.length){
+    buildGolem(anc[h].reduce((a, p) => a + p.x, 0) / 5, 0);
+    const hip = Math.min(anc[h][2].y + .78 * G, H - 8 - .62 * G);
+    P.forEach(p => { p.y += hip; p.oy += hip; });
+  }
+  att[h] = true; rebuildStrings(); $('msg').style.opacity = 0;
+}
+
+function updateHands(){
+  for(let h = 0; h < 2; h++){
+    const pts = hands[h];
+    if(pts){
+      miss[h] = 0;
+      if(!att[h]) attach(h);
+      TIP.forEach((id, i) => { anc[h][i].x += (pts[id].x - anc[h][i].x) * .55; anc[h][i].y += (pts[id].y - anc[h][i].y) * .55; });
+    } else if(att[h] && ++miss[h] > 8){ att[h] = false; rebuildStrings(); }   // that hand's strings drop
+  }
+}
+
+function physics(){
+  const gr = G * .0022, vmax = G * .12;
+  P.forEach(p => {
+    let vx = (p.x - p.ox) * .992, vy = (p.y - p.oy) * .992 + gr;
+    const v = Math.hypot(vx, vy); if(v > vmax){ vx *= vmax / v; vy *= vmax / v; }
+    p.ox = p.x; p.oy = p.y; p.x += vx; p.y += vy;
+  });
+  for(let it = 0; it < 10; it++){
+    C.forEach(c => {
+      const A = P[c.a], B = P[c.b], dx = B.x - A.x, dy = B.y - A.y, d = Math.hypot(dx, dy) || 1e-3;
+      if(c.min && d >= c.len) return;
+      const f = (d - c.len) / d * .5 * (c.k || 1);
+      A.x += dx * f; A.y += dy * f; B.x -= dx * f; B.y -= dy * f;
+    });
+    strings.forEach(s => {   // a string only pulls when taut
+      const a = anc[s.h][s.tip], p = P[s.part], dx = a.x - p.x, dy = a.y - p.y, d = Math.hypot(dx, dy);
+      if(d > s.len){ const f = (d - s.len) / d * .85; p.x += dx * f; p.y += dy * f; }
+    });
+    P.forEach(p => {
+      if(p.y > H - 8){ p.y = H - 8; p.ox += (p.x - p.ox) * .5; }
+      p.x = Math.max(6, Math.min(W - 6, p.x));
+    });
+  }
+}
+
+/* ---------------- DRAWING ---------------- */
+const pt = n => P[I[n]];
+function limb(a, b, w){
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = '#14171c'; ctx.lineWidth = w + 6; ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+  ctx.strokeStyle = '#69707b'; ctx.lineWidth = w; ctx.stroke();
+  ctx.strokeStyle = 'rgba(200,210,220,.35)'; ctx.lineWidth = w * .25;
+  ctx.beginPath(); ctx.moveTo(a.x - w * .2, a.y - w * .2); ctx.lineTo(b.x - w * .2, b.y - w * .2); ctx.stroke();
+}
+function rock(x, y, w, h, rot, tint){
+  ctx.save(); ctx.translate(x, y); ctx.rotate(rot); ctx.lineJoin = 'round';
+  const g = ctx.createLinearGradient(-w / 2, -h / 2, w / 2, h / 2); g.addColorStop(0, tint || '#9097a2'); g.addColorStop(1, '#454b55');
+  ctx.fillStyle = g; ctx.strokeStyle = '#14171c'; ctx.lineWidth = 6;
+  ctx.strokeRect(-w / 2, -h / 2, w, h); ctx.fillRect(-w / 2, -h / 2, w, h);
+  ctx.restore();
+}
+function orb(x, y, r, a){
+  const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+  g.addColorStop(0, `rgba(255,240,200,${a})`); g.addColorStop(.4, `rgba(${RUNE},${a * .8})`); g.addColorStop(1, `rgba(${RUNE},0)`);
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill();
+}
+function hex(x, y, r, rot){
+  ctx.beginPath();
+  for(let i = 0; i < 6; i++){ const a = rot + i * Math.PI / 3; ctx[i ? 'lineTo' : 'moveTo'](x + Math.cos(a) * r, y + Math.sin(a) * r); }
+  ctx.closePath();
+}
+const ang = (a, b) => Math.atan2(b.y - a.y, b.x - a.x);
+
+function drawGolem(t, tension){
+  const sL = pt('shL'), sR = pt('shR'), hL = pt('hpL'), hR = pt('hpR');
+  // floor shadow
+  const fy = Math.max(pt('ftL').y, pt('ftR').y);
+  ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.beginPath(); ctx.ellipse((pt('ftL').x + pt('ftR').x) / 2, Math.min(H - 4, fy + 6), G * .3, G * .05, 0, 0, 7); ctx.fill();
+  // legs
+  [['L','hpL','knL','ftL'], ['R','hpR','knR','ftR']].forEach(([, a, b, c]) => {
+    limb(pt(a), pt(b), G * .12); limb(pt(b), pt(c), G * .12);
+    rock(pt(b).x, pt(b).y, G * .14, G * .14, t * 0 + ang(pt(a), pt(c)));
+    rock(pt(c).x, pt(c).y + G * .02, G * .2, G * .09, 0);
+  });
+  // torso
+  const cx = (sL.x + sR.x + hL.x + hR.x) / 4, cy = (sL.y + sR.y + hL.y + hR.y) / 4, k = 1.35;
+  const q = [sL, sR, hR, hL].map(p => ({ x: cx + (p.x - cx) * k, y: cy + (p.y - cy) * 1.12 }));
+  const g = ctx.createLinearGradient(sL.x, sL.y, hR.x, hR.y); g.addColorStop(0, '#8a919c'); g.addColorStop(1, '#3f454e');
+  ctx.lineJoin = 'round'; ctx.strokeStyle = '#14171c'; ctx.lineWidth = 7; ctx.fillStyle = g;
+  ctx.beginPath(); q.forEach((p, i) => ctx[i ? 'lineTo' : 'moveTo'](p.x, p.y)); ctx.closePath(); ctx.stroke(); ctx.fill();
+  // rune core, brighter the tighter the strings
+  const glow = .45 + .5 * tension + .1 * Math.sin(t * .06);
+  orb(cx, cy, G * .26, glow);
+  ctx.strokeStyle = `rgba(255,235,190,${.5 + .4 * tension})`; ctx.lineWidth = 2;
+  hex(cx, cy, G * .1, t * .02); ctx.stroke(); hex(cx, cy, G * .055, -t * .03); ctx.stroke();
+  // head
+  const h = pt('head'), ha = ang(sL, sR), hs = G * .21;
+  rock(h.x, h.y, hs, hs * .9, ha, '#a1a8b3');
+  ctx.save(); ctx.translate(h.x, h.y); ctx.rotate(ha);
+  ctx.fillStyle = `rgba(${RUNE},1)`; if(!LOW){ ctx.shadowColor = `rgb(${RUNE})`; ctx.shadowBlur = 12; }
+  ctx.fillRect(-hs * .3, -hs * .08, hs * .2, hs * .1); ctx.fillRect(hs * .1, -hs * .08, hs * .2, hs * .1);
+  ctx.shadowBlur = 0; ctx.fillStyle = '#14171c'; ctx.fillRect(-hs * .22, hs * .18, hs * .44, hs * .06);
+  ctx.restore();
+  // arms (in front)
+  [['shL','elL','haL'], ['shR','elR','haR']].forEach(([a, b, c]) => {
+    limb(pt(a), pt(b), G * .1); limb(pt(b), pt(c), G * .1);
+    rock(pt(a).x, pt(a).y, G * .16, G * .16, 0.4);
+    rock(pt(b).x, pt(b).y, G * .11, G * .11, ang(pt(a), pt(c)));
+    rock(pt(c).x, pt(c).y, G * .15, G * .15, ang(pt(b), pt(c)), '#a8afba');
+    orb(pt(c).x, pt(c).y, G * .08, .5 + .4 * tension);
+  });
+}
+
+function drawStrings(){
+  let tsum = 0;
+  strings.forEach(s => {
+    const a = anc[s.h][s.tip], p = P[s.part], d = Math.hypot(a.x - p.x, a.y - p.y);
+    const tn = Math.min(1, d / s.len), slack = Math.max(0, s.len - d);
+    tsum += tn;
+    ctx.strokeStyle = `rgba(255,${235 - 70 * tn | 0},${210 - 140 * tn | 0},${.35 + .55 * tn})`; ctx.lineWidth = 1 + tn * 1.2;
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.quadraticCurveTo((a.x + p.x) / 2, (a.y + p.y) / 2 + slack * .45, p.x, p.y); ctx.stroke();
+    ctx.fillStyle = `rgba(${RUNE},.95)`; ctx.beginPath(); ctx.arc(p.x, p.y, 3.5, 0, 7); ctx.fill();
+  });
+  return strings.length ? Math.pow(tsum / strings.length, 3) : 0;
+}
+
+function drawHands(){
+  hands.forEach(pts => {
+    ctx.fillStyle = 'rgba(255,240,210,.35)'; pts.forEach(p => { ctx.beginPath(); ctx.arc(p.x, p.y, 2, 0, 7); ctx.fill(); });
+    ctx.strokeStyle = 'rgba(255,240,210,.9)'; ctx.lineWidth = 1.5;
+    TIP.forEach(id => { ctx.beginPath(); ctx.arc(pts[id].x, pts[id].y, 7, 0, 7); ctx.stroke(); });
+  });
+}
+
+let t = 0, prev = 0;
+function frame(now){
+  requestAnimationFrame(frame);
+  const steps = Math.min(3, Math.max(1, Math.round((now - prev) / 16.7))); prev = now; t++;
+  ctx.clearRect(0, 0, W, H);
+  updateHands();
+  if(P.length){
+    for(let i = 0; i < steps; i++) physics();
+    const tension = strings.length ? (() => { let s = 0; strings.forEach(x => { const a = anc[x.h][x.tip], p = P[x.part]; s += Math.min(1, Math.hypot(a.x - p.x, a.y - p.y) / x.len); }); return Math.pow(s / strings.length, 3); })() : 0;
+    drawGolem(t, tension); drawStrings();
+  }
+  drawHands();
+}
+
+cv.addEventListener('pointerdown', () => {   // tap: stand the golem back up under your hand
+  P = []; strings = []; att = [false, false];
+});
+
+/* ---------------- CAMERA ---------------- */
+function showError(m){ $('state').textContent = m; $('start').textContent = 'RETRY'; $('start').style.display = ''; }
+function explain(e){
+  switch(e && e.name){
+    case 'NotAllowedError': case 'SecurityError': return 'CAMERA BLOCKED: allow camera access in the browser, then retry';
+    case 'NotFoundError': return 'NO CAMERA FOUND';
+    case 'NotReadableError': return 'CAMERA BUSY: close other apps using it, then retry';
+    case 'Insecure': return 'OPEN VIA HTTPS OR LOCALHOST: browsers block the camera on insecure pages';
+    case 'NoLib': return 'HAND MODEL FAILED TO LOAD: check your internet connection';
+    default: return 'ERROR: ' + ((e && (e.message || e.name)) || 'unknown');
+  }
+}
+async function openCamera(){
+  if(!window.isSecureContext) throw { name: 'Insecure' };
+  if(stream) stream.getTracks().forEach(x => x.stop());
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: facing, width: { ideal: LOW ? 640 : 1280 }, height: { ideal: LOW ? 480 : 720 } }, audio: false });
+  }catch(e){
+    if(e.name === 'OverconstrainedError' || e.name === 'NotFoundError') stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    else throw e;
+  }
+  video.srcObject = stream; await video.play();
+  if(!video.videoWidth) await new Promise(r => video.addEventListener('loadedmetadata', r, { once: true }));
+  mirror = (stream.getVideoTracks()[0].getSettings().facingMode || facing) !== 'environment';
+  video.style.transform = mirror ? 'scaleX(-1)' : 'none';
+}
+async function detectLoop(){
+  if(!running) return;
+  if(video.readyState >= 2 && video.currentTime !== lastTime){
+    lastTime = video.currentTime;
+    try{ await model.send({ image: video }); }catch(e){}
+  }
+  requestAnimationFrame(detectLoop);
+}
+async function start(){
+  $('start').style.display = 'none'; $('state').textContent = 'REQUESTING CAMERA...'; running = false;
+  try{
+    if(typeof Hands === 'undefined') throw { name: 'NoLib' };
+    await openCamera();
+    $('state').textContent = 'LOADING HAND MODEL...';
+    if(!model){
+      model = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${f}` });
+      model.setOptions({ maxNumHands: 2, modelComplexity: LOW ? 0 : 1, minDetectionConfidence: .6, minTrackingConfidence: .5 });
+      model.onResults(r => { hands = (r.multiHandLandmarks || []).map(h => h.map(toScreen)); });
+      await model.initialize();
+    }
+    running = true; $('state').textContent = ''; $('flip').hidden = false;
+    try{ if(navigator.wakeLock) navigator.wakeLock.request('screen').catch(() => {}); }catch(e){}
+    detectLoop();
+    if(!looping){ looping = true; requestAnimationFrame(frame); }
+  }catch(e){ console.error(e); showError(explain(e)); }
+}
+$('start').addEventListener('click', start);
+$('flip').addEventListener('click', async () => {
+  facing = facing === 'user' ? 'environment' : 'user';
+  try{ await openCamera(); }catch(e){ facing = facing === 'user' ? 'environment' : 'user'; await openCamera().catch(() => {}); }
+});
+document.addEventListener('visibilitychange', () => {
+  if(document.hidden) running = false;
+  else if(stream && model && !running){ running = true; detectLoop(); }
+});
+addEventListener('pagehide', () => { if(stream) stream.getTracks().forEach(x => x.stop()); });
+</script>
+</body>
+</html>
